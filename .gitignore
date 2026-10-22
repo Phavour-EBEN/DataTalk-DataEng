@@ -6,6 +6,6 @@ dist/
 wheels/
 *.egg-info
 *.parquet
-
+.env_encoded
 # Virtual environments
 .venv
