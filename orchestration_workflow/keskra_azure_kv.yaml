@@ -1,0 +1,72 @@
+id: 06_azure_kv
+namespace: zoomcamp
+
+tasks:
+  # --- Account ---
+  - id: azure_subscription_id
+    type: io.kestra.plugin.core.kv.Set
+    key: AZURE_SUBSCRIPTION_ID
+    kvType: STRING
+    value: 00000000-0000-0000-0000-000000000000 # TODO Subscriptions -> Subscription ID
+
+  - id: azure_tenant_id
+    type: io.kestra.plugin.core.kv.Set
+    key: AZURE_TENANT_ID
+    kvType: STRING
+    value: 00000000-0000-0000-0000-000000000000 # TODO Microsoft Entra ID -> Tenant ID
+
+  - id: azure_client_id
+    type: io.kestra.plugin.core.kv.Set
+    key: AZURE_CLIENT_ID
+    kvType: STRING
+    value: 00000000-0000-0000-0000-000000000000 # TODO App registrations -> kestra-sp -> Application (client) ID
+
+  - id: azure_resource_group
+    type: io.kestra.plugin.core.kv.Set
+    key: AZURE_RESOURCE_GROUP
+    kvType: STRING
+    value: zoomcamp-rg
+
+  - id: azure_location
+    type: io.kestra.plugin.core.kv.Set
+    key: AZURE_LOCATION
+    kvType: STRING
+    value: uksouth
+
+  # --- Storage (replaces GCS bucket) ---
+  - id: azure_storage_account
+    type: io.kestra.plugin.core.kv.Set
+    key: AZURE_STORAGE_ACCOUNT
+    kvType: STRING
+    value: yournamekestra # TODO your storage account name
+
+  - id: azure_container_name
+    type: io.kestra.plugin.core.kv.Set
+    key: AZURE_CONTAINER_NAME
+    kvType: STRING
+    value: zoomcamp
+
+  # --- Azure SQL (replaces BigQuery dataset) ---
+  - id: azure_sql_server
+    type: io.kestra.plugin.core.kv.Set
+    key: AZURE_SQL_SERVER
+    kvType: STRING
+    value: yourname-zoomcamp-sql.database.windows.net # TODO SQL database -> Overview -> Server name
+
+  - id: azure_sql_database
+    type: io.kestra.plugin.core.kv.Set
+    key: AZURE_SQL_DATABASE
+    kvType: STRING
+    value: zoomcamp
+
+  - id: azure_sql_schema
+    type: io.kestra.plugin.core.kv.Set
+    key: AZURE_SQL_SCHEMA
+    kvType: STRING
+    value: zoomcamp
+
+  - id: azure_sql_user
+    type: io.kestra.plugin.core.kv.Set
+    key: AZURE_SQL_USER
+    kvType: STRING
+    value: zoomcampadmin # TODO the server admin login you chose

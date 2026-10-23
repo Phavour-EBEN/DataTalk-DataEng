@@ -1,0 +1,331 @@
+id: 08_azure_taxi
+namespace: zoomcamp
+description: |
+  The CSV Data used in the course: https://github.com/DataTalksClub/nyc-tlc-data/releases
+  Azure version: Blob Storage replaces GCS, Azure SQL Database replaces BigQuery.
+
+inputs:
+  - id: taxi
+    type: SELECT
+    displayName: Select taxi type
+    values: [yellow, green]
+    defaults: green
+
+  - id: year
+    type: SELECT
+    displayName: Select year
+    values: ["2019", "2020"]
+    defaults: "2019"
+    allowCustomValue: true # allows you to type 2021 from the UI for the homework 🤗
+
+  - id: month
+    type: SELECT
+    displayName: Select month
+    values: ["01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12"]
+    defaults: "01"
+
+variables:
+  file: "{{inputs.taxi}}_tripdata_{{inputs.year}}-{{inputs.month}}.csv"
+  table: "{{kv('AZURE_SQL_SCHEMA')}}.{{inputs.taxi}}_tripdata_{{inputs.year}}_{{inputs.month}}"
+  data: "{{outputs.extract.outputFiles[inputs.taxi ~ '_tripdata_' ~ inputs.year ~ '-' ~ inputs.month ~ '.csv']}}"
+
+tasks:
+  - id: set_label
+    type: io.kestra.plugin.core.execution.Labels
+    labels:
+      file: "{{render(vars.file)}}"
+      taxi: "{{inputs.taxi}}"
+
+  - id: extract
+    type: io.kestra.plugin.scripts.shell.Commands
+    outputFiles:
+      - "*.csv"
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    commands:
+      - wget -qO- https://github.com/DataTalksClub/nyc-tlc-data/releases/download/{{inputs.taxi}}/{{render(vars.file)}}.gz | gunzip > {{render(vars.file)}}
+
+  - id: upload_to_blob
+    type: io.kestra.plugin.azure.storage.blob.Upload
+    from: "{{render(vars.data)}}"
+    name: "{{render(vars.file)}}"
+
+  # Lets Azure SQL read files from the blob container (replaces BigQuery's access to GCS).
+  # Re-applies the SAS token on every run, so a renewed token is picked up automatically.
+  # Kestra splits `sql` on ';', so no semicolons inside IF/ELSE or BEGIN...END blocks.
+  - id: sql_blob_data_source
+    type: io.kestra.plugin.jdbc.sqlserver.Queries
+    sql: |
+      IF NOT EXISTS (SELECT 1 FROM sys.symmetric_keys WHERE name = '##MS_DatabaseMasterKey##')
+        CREATE MASTER KEY;
+
+      IF EXISTS (SELECT 1 FROM sys.database_scoped_credentials WHERE name = 'zoomcamp_blob_sas')
+        ALTER DATABASE SCOPED CREDENTIAL zoomcamp_blob_sas
+          WITH IDENTITY = 'SHARED ACCESS SIGNATURE', SECRET = '{{secret('AZURE_STORAGE_SAS')}}'
+      ELSE
+        CREATE DATABASE SCOPED CREDENTIAL zoomcamp_blob_sas
+          WITH IDENTITY = 'SHARED ACCESS SIGNATURE', SECRET = '{{secret('AZURE_STORAGE_SAS')}}';
+
+      IF NOT EXISTS (SELECT 1 FROM sys.external_data_sources WHERE name = 'zoomcamp_blob')
+        CREATE EXTERNAL DATA SOURCE zoomcamp_blob WITH (
+          TYPE = BLOB_STORAGE,
+          LOCATION = 'https://{{kv('AZURE_STORAGE_ACCOUNT')}}.blob.core.windows.net/{{kv('AZURE_CONTAINER_NAME')}}',
+          CREDENTIAL = zoomcamp_blob_sas
+        );
+
+  - id: if_yellow_taxi
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{inputs.taxi == 'yellow'}}"
+    then:
+      - id: sql_yellow_tripdata
+        type: io.kestra.plugin.jdbc.sqlserver.Queries
+        sql: |
+          IF OBJECT_ID('{{kv('AZURE_SQL_SCHEMA')}}.yellow_tripdata', 'U') IS NULL
+          BEGIN
+            CREATE TABLE {{kv('AZURE_SQL_SCHEMA')}}.yellow_tripdata (
+                unique_row_id         VARBINARY(16),
+                filename              VARCHAR(100),
+                VendorID              VARCHAR(10),
+                tpep_pickup_datetime  DATETIME2,
+                tpep_dropoff_datetime DATETIME2,
+                passenger_count       INT,
+                trip_distance         DECIMAL(12,2),
+                RatecodeID            VARCHAR(10),
+                store_and_fwd_flag    VARCHAR(10),
+                PULocationID          VARCHAR(10),
+                DOLocationID          VARCHAR(10),
+                payment_type          INT,
+                fare_amount           DECIMAL(12,2),
+                extra                 DECIMAL(12,2),
+                mta_tax               DECIMAL(12,2),
+                tip_amount            DECIMAL(12,2),
+                tolls_amount          DECIMAL(12,2),
+                improvement_surcharge DECIMAL(12,2),
+                total_amount          DECIMAL(12,2),
+                congestion_surcharge  DECIMAL(12,2)
+            )
+            CREATE INDEX ix_yellow_tripdata_unique_row_id ON {{kv('AZURE_SQL_SCHEMA')}}.yellow_tripdata (unique_row_id)
+            CREATE INDEX ix_yellow_tripdata_pickup ON {{kv('AZURE_SQL_SCHEMA')}}.yellow_tripdata (tpep_pickup_datetime)
+          END;
+
+      # Staging table loaded straight from the blob file (replaces the BigQuery external table).
+      # All columns are text so bad values in the raw CSV can't fail the load.
+      - id: sql_yellow_table_ext
+        type: io.kestra.plugin.jdbc.sqlserver.Queries
+        sql: |
+          DROP TABLE IF EXISTS {{render(vars.table)}}_ext;
+          CREATE TABLE {{render(vars.table)}}_ext (
+              VendorID              VARCHAR(50),
+              tpep_pickup_datetime  VARCHAR(50),
+              tpep_dropoff_datetime VARCHAR(50),
+              passenger_count       VARCHAR(50),
+              trip_distance         VARCHAR(50),
+              RatecodeID            VARCHAR(50),
+              store_and_fwd_flag    VARCHAR(50),
+              PULocationID          VARCHAR(50),
+              DOLocationID          VARCHAR(50),
+              payment_type          VARCHAR(50),
+              fare_amount           VARCHAR(50),
+              extra                 VARCHAR(50),
+              mta_tax               VARCHAR(50),
+              tip_amount            VARCHAR(50),
+              tolls_amount          VARCHAR(50),
+              improvement_surcharge VARCHAR(50),
+              total_amount          VARCHAR(50),
+              congestion_surcharge  VARCHAR(50)
+          );
+          BULK INSERT {{render(vars.table)}}_ext
+          FROM '{{render(vars.file)}}'
+          WITH (
+              DATA_SOURCE = 'zoomcamp_blob',
+              FORMAT = 'CSV',
+              FIRSTROW = 2,
+              FIELDQUOTE = '"',
+              ROWTERMINATOR = '0x0a',
+              KEEPNULLS,
+              TABLOCK
+          );
+
+      - id: sql_yellow_table_tmp
+        type: io.kestra.plugin.jdbc.sqlserver.Queries
+        sql: |
+          DROP TABLE IF EXISTS {{render(vars.table)}};
+          SELECT
+            HASHBYTES('MD5', CONCAT(VendorID, tpep_pickup_datetime, tpep_dropoff_datetime, PULocationID, DOLocationID)) AS unique_row_id,
+            CAST('{{render(vars.file)}}' AS VARCHAR(100)) AS filename,
+            VendorID,
+            TRY_CAST(tpep_pickup_datetime AS DATETIME2) AS tpep_pickup_datetime,
+            TRY_CAST(tpep_dropoff_datetime AS DATETIME2) AS tpep_dropoff_datetime,
+            TRY_CAST(passenger_count AS INT) AS passenger_count,
+            TRY_CAST(trip_distance AS DECIMAL(12,2)) AS trip_distance,
+            RatecodeID,
+            store_and_fwd_flag,
+            PULocationID,
+            DOLocationID,
+            TRY_CAST(payment_type AS INT) AS payment_type,
+            TRY_CAST(fare_amount AS DECIMAL(12,2)) AS fare_amount,
+            TRY_CAST(extra AS DECIMAL(12,2)) AS extra,
+            TRY_CAST(mta_tax AS DECIMAL(12,2)) AS mta_tax,
+            TRY_CAST(tip_amount AS DECIMAL(12,2)) AS tip_amount,
+            TRY_CAST(tolls_amount AS DECIMAL(12,2)) AS tolls_amount,
+            TRY_CAST(improvement_surcharge AS DECIMAL(12,2)) AS improvement_surcharge,
+            TRY_CAST(total_amount AS DECIMAL(12,2)) AS total_amount,
+            TRY_CAST(congestion_surcharge AS DECIMAL(12,2)) AS congestion_surcharge
+          INTO {{render(vars.table)}}
+          FROM {{render(vars.table)}}_ext;
+          -- staging copy is no longer needed; dropping it saves database space
+          DROP TABLE {{render(vars.table)}}_ext;
+
+      # Same result as BigQuery's MERGE ... WHEN NOT MATCHED THEN INSERT.
+      # T-SQL MERGE needs a trailing ';', which Kestra strips when it splits the script.
+      - id: sql_yellow_merge
+        type: io.kestra.plugin.jdbc.sqlserver.Queries
+        sql: |
+          INSERT INTO {{kv('AZURE_SQL_SCHEMA')}}.yellow_tripdata (unique_row_id, filename, VendorID, tpep_pickup_datetime, tpep_dropoff_datetime, passenger_count, trip_distance, RatecodeID, store_and_fwd_flag, PULocationID, DOLocationID, payment_type, fare_amount, extra, mta_tax, tip_amount, tolls_amount, improvement_surcharge, total_amount, congestion_surcharge)
+          SELECT S.unique_row_id, S.filename, S.VendorID, S.tpep_pickup_datetime, S.tpep_dropoff_datetime, S.passenger_count, S.trip_distance, S.RatecodeID, S.store_and_fwd_flag, S.PULocationID, S.DOLocationID, S.payment_type, S.fare_amount, S.extra, S.mta_tax, S.tip_amount, S.tolls_amount, S.improvement_surcharge, S.total_amount, S.congestion_surcharge
+          FROM {{render(vars.table)}} AS S
+          WHERE NOT EXISTS (
+            SELECT 1 FROM {{kv('AZURE_SQL_SCHEMA')}}.yellow_tripdata AS T
+            WHERE T.unique_row_id = S.unique_row_id
+          );
+
+  - id: if_green_taxi
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{inputs.taxi == 'green'}}"
+    then:
+      - id: sql_green_tripdata
+        type: io.kestra.plugin.jdbc.sqlserver.Queries
+        sql: |
+          IF OBJECT_ID('{{kv('AZURE_SQL_SCHEMA')}}.green_tripdata', 'U') IS NULL
+          BEGIN
+            CREATE TABLE {{kv('AZURE_SQL_SCHEMA')}}.green_tripdata (
+                unique_row_id         VARBINARY(16),
+                filename              VARCHAR(100),
+                VendorID              VARCHAR(10),
+                lpep_pickup_datetime  DATETIME2,
+                lpep_dropoff_datetime DATETIME2,
+                store_and_fwd_flag    VARCHAR(10),
+                RatecodeID            VARCHAR(10),
+                PULocationID          VARCHAR(10),
+                DOLocationID          VARCHAR(10),
+                passenger_count       INT,
+                trip_distance         DECIMAL(12,2),
+                fare_amount           DECIMAL(12,2),
+                extra                 DECIMAL(12,2),
+                mta_tax               DECIMAL(12,2),
+                tip_amount            DECIMAL(12,2),
+                tolls_amount          DECIMAL(12,2),
+                ehail_fee             DECIMAL(12,2),
+                improvement_surcharge DECIMAL(12,2),
+                total_amount          DECIMAL(12,2),
+                payment_type          INT,
+                trip_type             VARCHAR(10),
+                congestion_surcharge  DECIMAL(12,2)
+            )
+            CREATE INDEX ix_green_tripdata_unique_row_id ON {{kv('AZURE_SQL_SCHEMA')}}.green_tripdata (unique_row_id)
+            CREATE INDEX ix_green_tripdata_pickup ON {{kv('AZURE_SQL_SCHEMA')}}.green_tripdata (lpep_pickup_datetime)
+          END;
+
+      # Staging table loaded straight from the blob file (replaces the BigQuery external table).
+      # All columns are text so bad values in the raw CSV can't fail the load.
+      - id: sql_green_table_ext
+        type: io.kestra.plugin.jdbc.sqlserver.Queries
+        sql: |
+          DROP TABLE IF EXISTS {{render(vars.table)}}_ext;
+          CREATE TABLE {{render(vars.table)}}_ext (
+              VendorID              VARCHAR(50),
+              lpep_pickup_datetime  VARCHAR(50),
+              lpep_dropoff_datetime VARCHAR(50),
+              store_and_fwd_flag    VARCHAR(50),
+              RatecodeID            VARCHAR(50),
+              PULocationID          VARCHAR(50),
+              DOLocationID          VARCHAR(50),
+              passenger_count       VARCHAR(50),
+              trip_distance         VARCHAR(50),
+              fare_amount           VARCHAR(50),
+              extra                 VARCHAR(50),
+              mta_tax               VARCHAR(50),
+              tip_amount            VARCHAR(50),
+              tolls_amount          VARCHAR(50),
+              ehail_fee             VARCHAR(50),
+              improvement_surcharge VARCHAR(50),
+              total_amount          VARCHAR(50),
+              payment_type          VARCHAR(50),
+              trip_type             VARCHAR(50),
+              congestion_surcharge  VARCHAR(50)
+          );
+          BULK INSERT {{render(vars.table)}}_ext
+          FROM '{{render(vars.file)}}'
+          WITH (
+              DATA_SOURCE = 'zoomcamp_blob',
+              FORMAT = 'CSV',
+              FIRSTROW = 2,
+              FIELDQUOTE = '"',
+              ROWTERMINATOR = '0x0a',
+              KEEPNULLS,
+              TABLOCK
+          );
+
+      - id: sql_green_table_tmp
+        type: io.kestra.plugin.jdbc.sqlserver.Queries
+        sql: |
+          DROP TABLE IF EXISTS {{render(vars.table)}};
+          SELECT
+            HASHBYTES('MD5', CONCAT(VendorID, lpep_pickup_datetime, lpep_dropoff_datetime, PULocationID, DOLocationID)) AS unique_row_id,
+            CAST('{{render(vars.file)}}' AS VARCHAR(100)) AS filename,
+            VendorID,
+            TRY_CAST(lpep_pickup_datetime AS DATETIME2) AS lpep_pickup_datetime,
+            TRY_CAST(lpep_dropoff_datetime AS DATETIME2) AS lpep_dropoff_datetime,
+            store_and_fwd_flag,
+            RatecodeID,
+            PULocationID,
+            DOLocationID,
+            TRY_CAST(passenger_count AS INT) AS passenger_count,
+            TRY_CAST(trip_distance AS DECIMAL(12,2)) AS trip_distance,
+            TRY_CAST(fare_amount AS DECIMAL(12,2)) AS fare_amount,
+            TRY_CAST(extra AS DECIMAL(12,2)) AS extra,
+            TRY_CAST(mta_tax AS DECIMAL(12,2)) AS mta_tax,
+            TRY_CAST(tip_amount AS DECIMAL(12,2)) AS tip_amount,
+            TRY_CAST(tolls_amount AS DECIMAL(12,2)) AS tolls_amount,
+            TRY_CAST(ehail_fee AS DECIMAL(12,2)) AS ehail_fee,
+            TRY_CAST(improvement_surcharge AS DECIMAL(12,2)) AS improvement_surcharge,
+            TRY_CAST(total_amount AS DECIMAL(12,2)) AS total_amount,
+            TRY_CAST(payment_type AS INT) AS payment_type,
+            trip_type,
+            TRY_CAST(congestion_surcharge AS DECIMAL(12,2)) AS congestion_surcharge
+          INTO {{render(vars.table)}}
+          FROM {{render(vars.table)}}_ext;
+          -- staging copy is no longer needed; dropping it saves database space
+          DROP TABLE {{render(vars.table)}}_ext;
+
+      # Same result as BigQuery's MERGE ... WHEN NOT MATCHED THEN INSERT.
+      # T-SQL MERGE needs a trailing ';', which Kestra strips when it splits the script.
+      - id: sql_green_merge
+        type: io.kestra.plugin.jdbc.sqlserver.Queries
+        sql: |
+          INSERT INTO {{kv('AZURE_SQL_SCHEMA')}}.green_tripdata (unique_row_id, filename, VendorID, lpep_pickup_datetime, lpep_dropoff_datetime, store_and_fwd_flag, RatecodeID, PULocationID, DOLocationID, passenger_count, trip_distance, fare_amount, extra, mta_tax, tip_amount, tolls_amount, ehail_fee, improvement_surcharge, total_amount, payment_type, trip_type, congestion_surcharge)
+          SELECT S.unique_row_id, S.filename, S.VendorID, S.lpep_pickup_datetime, S.lpep_dropoff_datetime, S.store_and_fwd_flag, S.RatecodeID, S.PULocationID, S.DOLocationID, S.passenger_count, S.trip_distance, S.fare_amount, S.extra, S.mta_tax, S.tip_amount, S.tolls_amount, S.ehail_fee, S.improvement_surcharge, S.total_amount, S.payment_type, S.trip_type, S.congestion_surcharge
+          FROM {{render(vars.table)}} AS S
+          WHERE NOT EXISTS (
+            SELECT 1 FROM {{kv('AZURE_SQL_SCHEMA')}}.green_tripdata AS T
+            WHERE T.unique_row_id = S.unique_row_id
+          );
+
+  - id: purge_files
+    type: io.kestra.plugin.core.storage.PurgeCurrentExecutionFiles
+    description: If you'd like to explore Kestra outputs, disable it.
+    disabled: false
+
+pluginDefaults:
+  # No credentials here: the blob tasks sign in as the kestra-sp service principal through the
+  # AZURE_TENANT_ID / AZURE_CLIENT_ID / AZURE_CLIENT_SECRET env vars set on the Kestra container.
+  - type: io.kestra.plugin.azure.storage.blob
+    values:
+      endpoint: "https://{{kv('AZURE_STORAGE_ACCOUNT')}}.blob.core.windows.net"
+      container: "{{kv('AZURE_CONTAINER_NAME')}}"
+
+  - type: io.kestra.plugin.jdbc.sqlserver
+    values:
+      url: "jdbc:sqlserver://{{kv('AZURE_SQL_SERVER')}}:1433;database={{kv('AZURE_SQL_DATABASE')}};encrypt=true;trustServerCertificate=false"
+      username: "{{kv('AZURE_SQL_USER')}}"
+      password: "{{secret('AZURE_SQL_PASSWORD')}}"

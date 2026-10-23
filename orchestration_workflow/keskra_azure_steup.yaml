@@ -1,0 +1,26 @@
+id: 07_azure_setup
+namespace: zoomcamp
+
+tasks:
+  - id: create_blob_container
+    type: io.kestra.plugin.azure.cli.AzCLI
+    tenant: "{{ kv('AZURE_TENANT_ID') }}"
+    username: "{{ kv('AZURE_CLIENT_ID') }}"
+    password: "{{ secret('AZURE_CLIENT_SECRET') }}"
+    servicePrincipal: true
+    commands:
+      # returns "created": false instead of failing if it already exists (same as ifExists: SKIP)
+      - az storage container create --name {{ kv('AZURE_CONTAINER_NAME') }} --account-name {{ kv('AZURE_STORAGE_ACCOUNT') }} --auth-mode login
+
+  - id: create_sql_schema
+    type: io.kestra.plugin.jdbc.sqlserver.Queries
+    sql: |
+      IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = '{{ kv('AZURE_SQL_SCHEMA') }}')
+        EXEC('CREATE SCHEMA [{{ kv('AZURE_SQL_SCHEMA') }}]');
+
+pluginDefaults:
+  - type: io.kestra.plugin.jdbc.sqlserver
+    values:
+      url: "jdbc:sqlserver://{{ kv('AZURE_SQL_SERVER') }}:1433;database={{ kv('AZURE_SQL_DATABASE') }};encrypt=true;trustServerCertificate=false"
+      username: "{{ kv('AZURE_SQL_USER') }}"
+      password: "{{ secret('AZURE_SQL_PASSWORD') }}"
