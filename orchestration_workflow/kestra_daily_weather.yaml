@@ -1,0 +1,67 @@
+id: daily_weather
+namespace: demo
+description: |
+  Teaching demo: pull yesterday's hourly New York temperatures from the free Open-Meteo API,
+  clean them with Python and load them into the local Postgres. Runs every morning at 06:00
+  and retries the API call if it fails. Set `fail_first_attempt` to true to watch a retry happen.
+
+inputs:
+  - id: fail_first_attempt        # demo switch: makes attempt 1 of `extract` fail on purpose
+    type: BOOL
+    defaults: false
+
+tasks:
+  - id: extract                   # pull weather from an API
+    type: io.kestra.plugin.scripts.python.Script
+    retry:
+      type: constant
+      interval: PT10S
+      maxAttempts: 3
+    containerImage: python:3.12-slim
+    beforeCommands:
+      - pip install --quiet requests
+    outputFiles:
+      - raw.json
+    script: |
+      import json, sys, requests
+      if "{{ inputs.fail_first_attempt }}" == "true" and {{ taskrun.attemptsCount }} == 0:
+          sys.exit("Weather API timed out (failure forced for this demo)")
+      r = requests.get(
+          "https://api.open-meteo.com/v1/forecast",
+          params={"latitude": 40.71, "longitude": -74.01, "hourly": "temperature_2m",
+                  "past_days": 1, "forecast_days": 0, "timezone": "America/New_York"},
+          timeout=30,
+      )
+      r.raise_for_status()
+      json.dump(r.json(), open("raw.json", "w"))
+      print(f"Downloaded {len(r.json()['hourly']['time'])} hourly readings")
+
+  - id: transform                 # clean it with Python
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: python:3.12-slim
+    inputFiles:
+      raw.json: "{{ outputs.extract.outputFiles['raw.json'] }}"
+    outputFiles:
+      - load.sql
+    script: |
+      import json
+      hourly = json.load(open("raw.json"))["hourly"]
+      rows = [(t, v) for t, v in zip(hourly["time"], hourly["temperature_2m"]) if v is not None]
+      values = ",\n".join(f"('{t}', {v})" for t, v in rows)
+      with open("load.sql", "w") as f:
+          f.write("CREATE TABLE IF NOT EXISTS weather_hourly (observed_at TIMESTAMP PRIMARY KEY, temp_c NUMERIC(4,1));\n")
+          f.write(f"INSERT INTO weather_hourly (observed_at, temp_c) VALUES\n{values}\n"
+                  "ON CONFLICT (observed_at) DO UPDATE SET temp_c = EXCLUDED.temp_c;\n")
+      print(f"Cleaned {len(rows)} rows")
+
+  - id: load                      # load it into Postgres
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    url: jdbc:postgresql://pgdatabase:5432/ny_taxi
+    username: root
+    password: "{{ secret('PG_PASSWORD') }}"
+    sql: "{{ read(outputs.transform.outputFiles['load.sql']) }}"
+
+triggers:
+  - id: every_morning             # runs it every day at 06:00
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 6 * * *"

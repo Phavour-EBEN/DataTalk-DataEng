@@ -9,3 +9,6 @@ wheels/
 .env_encoded
 # Virtual environments
 .venv
+
+#generated video files
+brag-output-*
